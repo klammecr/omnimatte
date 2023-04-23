@@ -224,6 +224,7 @@ class OmnimatteDataset(BaseDataset):
                 'input': inputs,
                 'mask': masks,
                 'flow': flow,
+                'homography': self.homographies[index].unsqueeze(0),
                 'bg_flow': bg_flow,
                 'bg_warp': bg_warp,
                 'confidence': confidence,
@@ -243,7 +244,7 @@ class OmnimatteDataset(BaseDataset):
                 scale = 1.
             else:
                 scale = np.random.uniform(1, 1.25)
-            jitter_size = (scale * np.array([self.opt.height, self.opt.width])).astype(np.int)
+            jitter_size = (scale * np.array([self.opt.height, self.opt.width])).astype(np.int32)
             start1 = np.random.randint(jitter_size[0] - self.opt.height + 1)
             start2 = np.random.randint(jitter_size[1] - self.opt.width + 1)
         else:

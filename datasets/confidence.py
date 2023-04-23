@@ -16,7 +16,7 @@
 """Generate confidence maps from optical flow."""
 import os
 import sys
-sys.path.append('.')
+sys.path.append('omnimatte')
 from utils import readFlow, numpy2im
 import glob
 from PIL import Image
@@ -66,6 +66,8 @@ if __name__ == "__main__":
     import argparse
     arguments = argparse.ArgumentParser()
     arguments.add_argument('--dataroot', type=str)
+    arguments.add_argument("--width", type=int, default=448)
+    arguments.add_argument("--height", type=int, default=256)
     opt = arguments.parse_args()
 
     forward_flo = sorted(glob.glob(os.path.join(opt.dataroot, 'flow', '*.flo')))
@@ -77,7 +79,9 @@ if __name__ == "__main__":
     os.makedirs(outdir, exist_ok=True)
     for i in range(len(forward_flo)):
         flo_f = readFlow(forward_flo[i])
+        flo_f = np.resize(flo_f, (opt.height, opt.width, 2))
         flo_b = readFlow(backward_flo[i])
+        flo_b = np.resize(flo_b, (opt.height, opt.width, 2))
         rgb = np.array(Image.open(rgb_paths[i]))
         confidence = compute_confidence(flo_f, flo_b, rgb)
         fp = os.path.join(outdir, f'{i+1:04d}.png')

@@ -101,6 +101,7 @@ class OmnimatteModel(BaseModel):
         self.flow_confidence = input['confidence'].to(self.device)
         self.jitter_grid = input['jitter_grid'].to(self.device)
         self.image_paths = input['image_path']
+        self.homography  = input['homography'].to(self.device)
         self.index = input['index']
 
     def gen_crop_params(self, orig_h, orig_w, crop_size=256):
@@ -113,12 +114,13 @@ class OmnimatteModel(BaseModel):
 
     def forward(self):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
-        outputs = self.netOmnimatte(self.input, self.input_bg_flow, self.input_bg_warp, self.jitter_grid, self.index, self.do_cam_adj)
+        outputs = self.netOmnimatte(self.input, self.input_bg_flow, self.input_bg_warp, self.jitter_grid, self.index, self.do_cam_adj, self.homography)
         # rearrange t, t+1 to batch dimension
         self.target_image = self.rearrange2batchdim(self.target_image)
         self.mask = self.rearrange2batchdim(self.mask)
         self.flow_confidence = self.rearrange2batchdim(self.flow_confidence)
         self.flow_gt = self.rearrange2batchdim(self.flow_gt)
+        self.homography    = self.rearrange2batchdim(self.homography)
         reconstruction_rgb = self.rearrange2batchdim(outputs['reconstruction_rgb'])
         self.reconstruction = reconstruction_rgb[:, :3]
         self.alpha_composite = reconstruction_rgb[:, 3:]
@@ -142,23 +144,51 @@ class OmnimatteModel(BaseModel):
         self.flow_vis = torch.cat([self.output_flow[:, :, l] for l in range(n_layers)], -2)
         self.flow_vis = utils.tensor_flow_to_image(self.flow_vis[0].detach()).unsqueeze(0)  # batchsize 1
 
-    def backward(self):
-        """Calculate losses, gradients, and update network weights; called in every training iteration"""
-        self.loss_recon = self.criterionLoss(self.reconstruction[:, :3], self.target_image)
-        self.loss_total = self.loss_recon
-        self.loss_alpha_reg = cal_alpha_reg(self.alpha_composite * .5 + .5, self.lambda_alpha_l1, self.lambda_alpha_l0)
-        alpha_layers = self.output_rgba[:, 3]
-        self.loss_mask = self.lambda_mask * self.criterionLossMask(alpha_layers, self.mask)
-        self.loss_recon_flow = self.lambda_recon_flow * self.criterionLoss(self.flow_confidence * self.reconstruction_flow, self.flow_confidence * self.flow_gt)
+
+    def compute_reconstruction_loss(self):
+        # RGB reconstruction loss
+        return self.criterionLoss(self.reconstruction[:, :3], self.target_image)
+    
+    def compute_flow_recon_loss(self):
+        # Weight both the reconstructed flow and the RAFT ground truth flow by the confidence
+        # Low confidence optical flows will be penalized less
+        return self.lambda_recon_flow * self.criterionLoss(self.flow_confidence * self.reconstruction_flow, self.flow_confidence * self.flow_gt)
+    
+    def compute_alpha_warp_loss(self, alpha_layers):
+        # Make sure the alpha is temporally consistent between frames
         b_sz = self.target_image.shape[0]
         alpha_t = alpha_layers[:b_sz // 2]
-        self.loss_alpha_warp = self.lambda_alpha_warp * self.criterionLoss(self.alpha_warped[:, 0], alpha_t)
+        return self.lambda_alpha_warp * self.criterionLoss(self.alpha_warped[:, 0], alpha_t)
+
+
+    def backward(self):
+        """Calculate losses, gradients, and update network weights; called in every training iteration"""
+        self.loss_recon     = self.compute_reconstruction_loss()
+        self.loss_alpha_reg = cal_alpha_reg(self.alpha_composite * .5 + .5, self.lambda_alpha_l1, self.lambda_alpha_l0)
+        self.loss_recon_flow = self.compute_flow_recon_loss()
+
+        # Get the alpha values for each layer
+        alpha_layers = self.output_rgba[:, 3]
+
+        # Compute mass loss, bootstrapping training so that our alphas match the mask
+        self.loss_mask = self.lambda_mask * self.criterionLossMask(alpha_layers, self.mask)
+
+        # For the images, ensure that the alpha is temporally consistent between frames
+        self.loss_alpha_warp = self.compute_alpha_warp_loss(alpha_layers)
+
+        # Loss Reconstruction Warp???
+        b_sz = self.target_image.shape[0]
         rgb_t = self.target_image[:b_sz // 2]
         self.loss_recon_warp = self.lambda_recon_warp * self.criterionLoss(self.reconstruction_warped, rgb_t)
+
+        # Regularization loss for the offset and the brightness
         brightness_reg = self.criterionLoss(self.brightness_scale, torch.ones_like(self.brightness_scale))
         offset_reg = self.bg_offset.abs().mean()
         self.loss_adj_reg = self.lambda_adj_reg * (brightness_reg + offset_reg)
-        self.loss_total += self.loss_alpha_reg + self.loss_mask + self.loss_recon_flow + self.loss_alpha_warp + self.loss_recon_warp + self.loss_adj_reg
+
+        # Compute the total loss
+        self.loss_total = self.loss_recon + self.loss_alpha_reg + self.loss_mask + self.loss_recon_flow + self.loss_alpha_warp + self.loss_recon_warp + self.loss_adj_reg
+
         self.loss_total.backward()
 
     def rearrange2batchdim(self, tensor):

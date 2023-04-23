@@ -16,7 +16,7 @@
 """Helper tools for computing the world bounds from homographies."""
 import os
 import sys
-sys.path.append('.')
+sys.path.append('omnimatte')
 from utils import readFlow, numpy2im
 import glob
 from PIL import Image
