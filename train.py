@@ -12,6 +12,7 @@ Use '--continue_train' to resume your previous training.
 
 See options/base_options.py and options/train_options.py for more training options.
 """
+# Third Party
 import time
 from options.train_options import TrainOptions
 from third_party.data import create_dataset
@@ -19,6 +20,10 @@ from third_party.models import create_model
 from third_party.util.visualizer import Visualizer
 import torch
 import numpy as np
+import os
+
+# In House
+from omnimatte.data.homography import HomographyManager
 
 
 def main():
@@ -28,21 +33,27 @@ def main():
     torch.manual_seed(opt.seed)
     np.random.seed(opt.seed)
 
+    # Create the Omnimatte dataset
     dataset = create_dataset(opt)
     dataset_size = len(dataset)
     print('The number of training images = %d' % dataset_size)
+
+    # Load in the homography manager
+    transform_params = dataset.dataset.get_params(do_jitter=opt.phase == 'train', jitter_rate=opt.jitter_rate)
+    hom_mgr = HomographyManager(os.path.join(opt.dataroot, 'homographies.txt'), len(dataset.dataset.image_paths), transform_params)
 
     opt.n_epochs = int(opt.n_steps / np.ceil(dataset_size / opt.batch_size))
     opt.n_epochs_decay = int(opt.n_steps_decay / np.ceil(dataset_size / opt.batch_size))
 
     model = create_model(opt)
     model.setup(opt)  # regular setup: load and print networks; create schedulers
+    model.set_hom_mgr(hom_mgr)
     visualizer = Visualizer(opt)
 
-    train(model, dataset, visualizer, opt)
+    train(model, dataset, visualizer, transform_params, opt)
 
 
-def train(model, dataset, visualizer, opt):
+def train(model, dataset, visualizer, transform_params, opt):
     dataset_size = len(dataset)
     total_iters = 0  # the total number of training iterations
 
@@ -58,7 +69,7 @@ def train(model, dataset, visualizer, opt):
 
             total_iters += opt.batch_size
             epoch_iter += opt.batch_size
-            model.set_input(data)
+            model.set_input(data, transform_params)
             model.optimize_parameters()
 
             if i % opt.print_freq == 0:  # print training losses and save logging information to the disk

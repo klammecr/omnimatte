@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-
+import torchvision.transforms as transforms
 
 def numpy2im(np_array):
     """convert numpy float image to PIL Image"""
@@ -45,6 +45,47 @@ def tensor_flow_to_image(flow_uv, clip_flow=None, convert_to_bgr=False):
     image = torch.from_numpy(image).permute(2, 0, 1)
     return image.float() / 255. * 2 - 1
 
+def load_and_process_image(im_path, mode='RGB', size=None):
+    """Read image file and return as tensor in range [-1, 1]."""
+    image = Image.open(im_path).convert(mode)
+    if size is not None:
+        image = image.resize(size)
+    image = transforms.ToTensor()(image)
+    image = 2 * image - 1
+    return image
+
+
+def load_and_resize_flow(flow_path, width=None, height=None):
+    flow = torch.from_numpy(readFlow(flow_path)).permute(2, 0, 1)
+    flow = resize_flow(flow, width, height)
+    return flow
+
+
+def apply_transform(data, params, interp_mode='bilinear'):
+    """Apply the transform to the data tensor."""
+    tensor_size = params['jitter size'].tolist()
+    crop_pos = params['crop pos']
+    crop_size = params['crop size']
+    orig_shape = data.shape
+    if len(orig_shape) < 4:
+        data = F.interpolate(data.unsqueeze(0), size=tensor_size, mode=interp_mode).squeeze(0)
+    else:
+        data = F.interpolate(data, size=tensor_size, mode=interp_mode)
+    data = data[..., crop_pos[0]:crop_pos[0] + crop_size[0], crop_pos[1]:crop_pos[1] + crop_size[1]]
+    return data
+
+def transform2h(x, y, m):
+    """Applies 2d homogeneous transformation."""
+    A = torch.matmul(m, torch.stack([x, y, torch.ones(len(x))]))
+    xt = A[0, :] / A[2, :]
+    yt = A[1, :] / A[2, :]
+    return xt, yt
+
+def create_grid(w, h):
+    ramp_u = torch.linspace(-1, 1, steps=w).unsqueeze(0).repeat(h, 1)
+    ramp_v = torch.linspace(-1, 1, steps=h).unsqueeze(-1).repeat(1, w)
+    grid = torch.stack([ramp_u, ramp_v], 0)
+    return grid
 
 # The following flow visualization code is from https://github.com/tomrunia/OpticalFlow_Visualization
 def make_colorwheel():

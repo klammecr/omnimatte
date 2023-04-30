@@ -77,7 +77,7 @@ class Omnimatte(nn.Module):
         self.max_frames = max_frames
         self.bg_offset = nn.Parameter(torch.zeros(1, 2, max_frames // coarseness, 4, 7))
         self.brightness_scale = nn.Parameter(torch.ones(1, 1, max_frames // coarseness, 4, 7))
-        self.hom_delta        = nn.Parameter(torch.zeros(1, max_frames, 3, 3))
+
 
     def render(self, x):
         """Pass inputs for a single layer through UNet.
@@ -99,7 +99,7 @@ class Omnimatte(nn.Module):
         flow = self.final_flow(x)
         return rgba, flow, x
 
-    def forward(self, input, bg_flow, bg_warp, jitter, index, do_adj, H):
+    def forward(self, input, bg_flow, bg_warp, jitter, index, do_adj):
         """Forward pass through layered neural renderer.
 
         1. Split input to t and t+1 since they are concatenated channelwise
@@ -129,13 +129,6 @@ class Omnimatte(nn.Module):
         layers_flow = []
         alphas_warped = []
         composite_warped = None
-
-        # Find the relative homography with the adjustment
-        gather_idx = index.unsqueeze(1).repeat(1, 9).reshape(len(index), 3, 3)
-        deltas = torch.gather(self.hom_delta, dim = 1, index = gather_idx.unsqueeze(0))
-
-        # For each element in the batch, find the relative homographies
-        final_H = torch.bmm(torch.inverse(H[:, 0]), H[:, 1]) + deltas
 
         # Warp the background via jitter
         bg_offset = F.interpolate(self.bg_offset, (self.max_frames, 4, 7), mode='trilinear', align_corners=True)
@@ -203,6 +196,7 @@ class Omnimatte(nn.Module):
             'alpha_warped': torch.stack(alphas_warped, 2),
             'reconstruction_warped': composite_warped,
             'bg_offset': bg_offset,
+            'bg_flow': bg_flow, # background flow
             'brightness_scale': br_scale
         }
         return outputs

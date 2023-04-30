@@ -20,6 +20,7 @@ from . import networks
 import numpy as np
 import torch.nn.functional as F
 import utils
+import os
 
 
 class OmnimatteModel(BaseModel):
@@ -36,6 +37,7 @@ class OmnimatteModel(BaseModel):
             parser.add_argument('--lambda_alpha_l0', type=float, default=0.005, help='alpha L0 sparsity loss weight')
             parser.add_argument('--alpha_l1_rolloff_epoch', type=int, default=200, help='turn off L1 alpha sparsity loss weight after this epoch')
             parser.add_argument('--lambda_mask', type=float, default=50, help='layer matting loss weight')
+            parser.add_argument('--lambda_bg_hom', type=float, default=0.5, help='How much to enforce to regularization of the background flow being close to 0')
             parser.add_argument('--mask_thresh', type=float, default=0.02, help='turn off masking loss when error falls below this value')
             parser.add_argument('--mask_loss_rolloff_epoch', type=int, default=-1, help='decrease masking loss after this epoch; if <0, use mask_thresh instead')
             parser.add_argument('--cam_adj_epoch', type=int, default=0, help='when to start optimizing camera adjustment params')
@@ -59,6 +61,19 @@ class OmnimatteModel(BaseModel):
         if self.isTrain:
             self.setup_train(opt)
 
+        # Load for the background
+        zbar_path = os.path.join(opt.dataroot, 'zbar.pth')
+        if not os.path.exists(zbar_path):
+            zbar = torch.randn(1, opt.in_c - 3, opt.height // 16, opt.width // 16)
+            torch.save(zbar, zbar_path)
+        else:
+            zbar = torch.load(zbar_path)
+        self.Zbar = zbar
+        self.Zbar_up = F.interpolate(zbar, (opt.height, opt.width), mode='bilinear')
+
+        # Homography mangager object in charge of all camera compensation between frames
+        self.hom_mgr = None
+
         # Our program will automatically call <model.setup> to define schedulers, load networks, and print networks
 
     def setup_train(self, opt):
@@ -72,6 +87,7 @@ class OmnimatteModel(BaseModel):
         self.criterionLossMask = MaskLoss().to(self.device)
         self.lambda_mask = opt.lambda_mask
         self.lambda_adj_reg = opt.lambda_adj_reg
+        self.lambda_bg_hom        = opt.lambda_bg_hom
         self.lambda_recon_flow = opt.lambda_recon_flow
         self.lambda_recon_warp = opt.lambda_recon_warp
         self.lambda_alpha_warp = opt.lambda_alpha_warp
@@ -82,27 +98,79 @@ class OmnimatteModel(BaseModel):
         self.optimizer = torch.optim.Adam(self.netOmnimatte.parameters(), lr=opt.lr)
         self.optimizers = [self.optimizer]
 
-    def set_input(self, input):
+    def set_input(self, input, transform_params):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
 
         Parameters:
             input: a dictionary that contains the data itself and its metadata information.
         """
-        self.target_image = input['image'].to(self.device)
-        if self.isTrain and self.jitter_rgb > 0:
-            # add brightness jitter to rgb
-            self.target_image += self.jitter_rgb * torch.randn(self.target_image.shape[0], 1, 1, 1).to(self.device)
-            self.target_image = torch.clamp(self.target_image, -1, 1)
-        self.input = input['input'].to(self.device)
-        self.input_bg_flow = input['bg_flow'].to(self.device)
-        self.input_bg_warp = input['bg_warp'].to(self.device)
+        # Setting convenience variables
+        input_flow = input['input_flow']
+        foreground_layers = input_flow.shape[1]
+        batch_size   = input['mask'].shape[0]
+        mask_h       = input['mask'].shape[2]
+        mask_w       = input['mask'].shape[3]
+        scale_w      = transform_params['jitter size'][1] / mask_w
+        scale_h      = transform_params['jitter size'][0] / mask_h
+        binary_masks = (input['mask'] > 0).float()
+        composite_order = tuple(range(1, 1 + foreground_layers))
+
+        # Allocate space for each of the buffers
+        self.input         = torch.zeros((batch_size, foreground_layers+1, 32, input_flow.shape[-2], input_flow.shape[-1]))
+        self.input_bg_flow = torch.zeros((batch_size, 4, input_flow.shape[-2], input_flow.shape[-1]))
+        self.input_bg_warp = torch.zeros((batch_size, 4, input_flow.shape[-2], input_flow.shape[-1]))
+
+
+        for batch_idx in range(batch_size):
+            for frame_idx, frame_num in enumerate(input['index'][batch_idx]):
+                # This will be the field to warp from the reference frame to the frame index
+                bg_warp = self.hom_mgr.get_background_uv(frame_num, mask_w, mask_h) * 2 - 1
+
+                # Create bg flow
+                bg_flow = self.hom_mgr.get_background_flow(frame_num, mask_h, mask_w, self.opt.width, self.opt.height)  # 2, H, W
+
+                # Create the background Z_t from homographies.
+                background_Zt = F.grid_sample(self.Zbar, bg_warp.permute(1, 2, 0).unsqueeze(0))  # C, H, W
+                background_Zt = background_Zt.repeat(foreground_layers, 1, 1, 1)
+                pids = torch.Tensor(composite_order).view(-1, 1, 1, 1) * binary_masks[batch_idx, frame_idx]  # L-1, 1, H, W
+                inputs = torch.cat((pids, input['input_flow'][batch_idx, :, 2*frame_idx:2*(frame_idx+1)], background_Zt), 1)  # L-1, 16, H, W
+
+                # Scale and transform
+                inputs[:, 1] *= scale_w
+                inputs[:, 2] *= scale_h
+                bg_warp = utils.apply_transform(bg_warp, transform_params, 'bilinear')
+                bg_flow = utils.apply_transform(bg_flow, transform_params, 'bilinear')
+                bg_flow[0] *= scale_w
+                bg_flow[1] *= scale_h
+
+                # Build inputs from masks, flow, background UVs, and unwrapped bg
+                background_input = torch.cat((torch.zeros(1, 3, mask_h, mask_w), self.Zbar_up), 1)
+                inputs = torch.cat((background_input, inputs))  # L, 16, H, W
+
+                # Set the data for the batch and the frame
+                self.input[batch_idx, :, 16*frame_idx:16*(frame_idx+1)] = inputs
+                self.input_bg_flow[batch_idx, 2*frame_idx:2*(frame_idx+1)] = bg_flow
+                self.input_bg_warp[batch_idx, 2*frame_idx:2*(frame_idx+1)] = bg_warp
+
+        # Put everything on the correct device
+        self.input = self.input.to(self.device)
+        self.input_bg_flow = self.input_bg_flow.to(self.device)
+        self.input_bg_warp = self.input_bg_warp.to(self.device)
+        self.target_image  = input['image'].to(self.device)
         self.mask = input['mask'].to(self.device)
         self.flow_gt = input['flow'].to(self.device)
         self.flow_confidence = input['confidence'].to(self.device)
         self.jitter_grid = input['jitter_grid'].to(self.device)
         self.image_paths = input['image_path']
-        self.homography  = input['homography'].to(self.device)
         self.index = input['index']
+
+        if self.isTrain and self.jitter_rgb > 0:
+            # add brightness jitter to rgb
+            self.target_image += self.jitter_rgb * torch.randn(self.target_image.shape[0], 1, 1, 1).to(self.device)
+            self.target_image = torch.clamp(self.target_image, -1, 1)
+
+    def set_hom_mgr(self, hom_mgr):
+        self.hom_mgr = hom_mgr
 
     def gen_crop_params(self, orig_h, orig_w, crop_size=256):
         """Generate random square cropping parameters."""
@@ -114,13 +182,13 @@ class OmnimatteModel(BaseModel):
 
     def forward(self):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
-        outputs = self.netOmnimatte(self.input, self.input_bg_flow, self.input_bg_warp, self.jitter_grid, self.index, self.do_cam_adj, self.homography)
+        outputs = self.netOmnimatte(self.input, self.input_bg_flow, self.input_bg_warp, self.jitter_grid, self.index, self.do_cam_adj)
+
         # rearrange t, t+1 to batch dimension
         self.target_image = self.rearrange2batchdim(self.target_image)
         self.mask = self.rearrange2batchdim(self.mask)
         self.flow_confidence = self.rearrange2batchdim(self.flow_confidence)
         self.flow_gt = self.rearrange2batchdim(self.flow_gt)
-        self.homography    = self.rearrange2batchdim(self.homography)
         reconstruction_rgb = self.rearrange2batchdim(outputs['reconstruction_rgb'])
         self.reconstruction = reconstruction_rgb[:, :3]
         self.alpha_composite = reconstruction_rgb[:, 3:]
@@ -159,7 +227,14 @@ class OmnimatteModel(BaseModel):
         b_sz = self.target_image.shape[0]
         alpha_t = alpha_layers[:b_sz // 2]
         return self.lambda_alpha_warp * self.criterionLoss(self.alpha_warped[:, 0], alpha_t)
-
+    
+    def compute_bg_flow_loss(self):
+        """
+        This loss ensures that the aligned background flow is as close to 0 as possible.
+        This should encourage the homography to more perfectly align the background
+        """
+        l1_bg_flow = F.l1_loss(self.bg_flow)
+        return self.lambda_bg_hom * l1_bg_flow
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
@@ -186,8 +261,11 @@ class OmnimatteModel(BaseModel):
         offset_reg = self.bg_offset.abs().mean()
         self.loss_adj_reg = self.lambda_adj_reg * (brightness_reg + offset_reg)
 
+        # Loss for the background flow
+        self.bg_flow_loss = self.compute_bg_flow_loss()
+
         # Compute the total loss
-        self.loss_total = self.loss_recon + self.loss_alpha_reg + self.loss_mask + self.loss_recon_flow + self.loss_alpha_warp + self.loss_recon_warp + self.loss_adj_reg
+        self.loss_total = self.loss_recon + self.loss_alpha_reg + self.loss_mask + self.loss_recon_flow + self.loss_alpha_warp + self.loss_recon_warp + self.loss_adj_reg + self.bg_flow_loss
 
         self.loss_total.backward()
 
